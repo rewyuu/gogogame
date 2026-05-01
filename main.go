@@ -3,30 +3,461 @@
 package main
 
 import (
+	"bytes"
+	"image/color"
 	"log"
+	"math"
+	"math/rand"
+	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/text/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+    "github.com/hajimehoshi/ebiten/v2/audio/mp3"
 )
-	
-type Game struct{}
 
+// Game implements ebiten.Game interface.
+type Game struct {
+
+	//font
+	fontFace  text.Face
+	titleFont text.Face  // ← bigger font for title
+	buttons   []*Button
+	bg        *ebiten.Image
+	time      float64
+	particles []*Particle
+	state     int
+	fadeAlpha float64
+	fadingOut bool
+	fadingIn  bool
+	gameScene *GameScene
+	audioContext *audio.Context 
+    musicPlayer  *audio.Player
+}
+
+const (
+	StateMenu = iota
+	StatePlaying
+)
+
+type Button struct {
+
+	//slide
+	label       string
+	timer       float64
+	duration    float64
+	startX      float64
+	targetX     float64
+	currentX    float64
+	delay       float64
+	targetY     float64
+	currentY    float64
+	index       float64
+	scale       float64
+	targetScale float64
+	lineWidth   float64
+	dimT        float64
+	alpha       float64
+	shakeX      float64
+	shakeTimer  float64
+	shakeDur    float64
+	clicked     bool
+}
+
+type Particle struct {
+	x     float64
+	y     float64
+	speed float64
+	phase float64 // offset so each particle moves differently
+	drift float64 // how much it sways left/right
+	size  float64
+}
+
+// Update proceeds the game state.
+// Update is called every tick (1/60 [s] by default).
 func (g *Game) Update() error {
+	g.time += 0.016
+
+	switch g.state {
+	case StateMenu:
+		anyHovered := false
+		for _, btn := range g.buttons {
+			if btn.IsHovered(40) {
+				anyHovered = true
+				break
+			}
+		}
+
+		for _, btn := range g.buttons {
+			isHovered := btn.IsHovered(40)
+			btn.Update(g.time, anyHovered, isHovered)
+
+			if justClicked() {
+				for _, btn := range g.buttons {
+					if btn.IsHovered(40) {
+						btn.clicked = true // triggers punch in next Update()
+						switch btn.label {
+						case "Quit":
+							return ebiten.Termination
+						case "Play":
+							g.fadingOut = true
+						}
+					}
+				}
+			}
+		}
+
+		for _, p := range g.particles {
+			p.Update(g.time)
+		}
+
+	case StatePlaying:
+		g.gameScene.Update(g)
+	}
+
+	// fade
+	if g.fadingOut {
+		g.fadeAlpha += 0.05
+		if g.fadeAlpha >= 1.0 {
+			g.fadeAlpha = 1.0
+			g.fadingOut = false
+			g.fadingIn = true      // start fading in
+			g.state = StatePlaying
+			g.musicPlayer.Rewind()  // start from beginning
+        	g.musicPlayer.Play()
+		}
+	}
+
+	if g.fadingIn {
+		g.fadeAlpha -= 0.05
+		if g.fadeAlpha <= 0 {
+			g.fadeAlpha = 0
+			g.fadingIn = false
+		}
+	}
+
 	return nil
 }
 
+// Draw draws the game screen.
+// Draw is called every frame (typically 1/60[s] for 60Hz display).
 func (g *Game) Draw(screen *ebiten.Image) {
-	ebitenutil.DebugPrint(screen, "Hello, World!")
+	//ebitenutil.DebugPrint(screen,"halo worldu")
+
+	// playText := &text.DrawOptions{}
+
+	switch g.state {
+	case StateMenu:
+		//background
+		screen.DrawImage(g.bg, nil)
+
+		//particles
+		for _, p := range g.particles {
+			ebitenutil.DrawRect(
+				screen,
+				p.x, p.y,
+				p.size, p.size,
+				color.RGBA{255, 255, 255, 80}, // white, semi transparent
+			)
+		}
+
+		// pastel color shared by title and buttons
+		t := g.time * 5
+		r  := float32(0.85 + math.Sin(t)*0.15)
+		gr := float32(0.7  + math.Sin(t+2.1)*0.15)
+		b  := float32(0.9  + math.Sin(t+4.2)*0.1)
+
+		// floating pastel title
+		titleFloat := 20.0 + math.Sin(g.time*1.2)*4
+
+		titleOp := &text.DrawOptions{}
+		titleOp.GeoM.Translate(18, titleFloat)
+		titleOp.ColorScale.Scale(r, gr, b, 1)
+		text.Draw(screen, "GOPHER ONLY", g.titleFont, titleOp)
+
+		titleOp2 := &text.DrawOptions{}
+		titleOp2.GeoM.Translate(30, titleFloat+26)
+		titleOp2.ColorScale.Scale(r, gr, b, 1)
+		text.Draw(screen, "PARTY LAND", g.titleFont, titleOp2)
+
+		//buttons
+		for _, btn := range g.buttons {
+			textWidth := 40.0
+			advance := text.Advance(btn.label, g.fontFace)
+			a := uint8(btn.alpha * 255)
+
+			op := &text.DrawOptions{}
+			op.GeoM.Translate(-textWidth/2, -8)
+			op.GeoM.Scale(btn.scale, btn.scale)
+			op.GeoM.Translate(btn.currentX+btn.shakeX+textWidth/2, btn.currentY+8) // shakeX
+			op.ColorScale.Scale(r, gr, b, float32(btn.alpha))                      //  pastel color with alpha
+
+			text.Draw(screen, btn.label, g.fontFace, op)
+
+			ebitenutil.DrawRect(
+				screen,
+				btn.currentX+btn.shakeX+(advance-btn.lineWidth)/2, // shakeX
+				btn.currentY+14,
+				btn.lineWidth,
+				1,
+				color.RGBA{255, 255, 255, a},
+			)
+		}
+	case StatePlaying:
+		// placeholder for now
+		g.gameScene.Draw(screen, g.fontFace)
+	}
+
+	// draw fade overlay on TOP of everything
+	if g.fadeAlpha > 0 {
+		fadeImg := ebiten.NewImage(320, 240)
+		fadeImg.Fill(color.RGBA{0, 0, 0, uint8(g.fadeAlpha * 255)})
+		screen.DrawImage(fadeImg, nil)
+	}
 }
 
+// Layout takes the outside size (e.g., the window size) and returns the (logical) screen size.
+// If you don't have to adjust the screen size with the outside size, just return a fixed size.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
 	return 320, 240
 }
 
 func main() {
-	ebiten.SetWindowSize(640, 480)
-	ebiten.SetWindowTitle("Hello, World!")
-	if err := ebiten.RunGame(&Game{}); err != nil {
+
+	// for setting the font size of da game
+	fontFace  := loadFont("assets/font/m6x11.ttf", 16)
+	titleFont := loadFont("assets/font/m6x11.ttf", 16)  // ← bigger for title
+
+	//music
+	audioContext := audio.NewContext(44100)
+	musicPlayer  := loadMusic(audioContext, "assets/music/party.mp3")
+
+	// Specify the window size as you like. Here, a doubled size is specified.
+	ebiten.SetWindowSize(1024, 768)
+	ebiten.SetWindowTitle("Mega Gopher Super Fun Party Ultra Deluxe Edition 9000: Game of the Century - Season Pass Included (Director's Cut) feat. Gabriel from ULTRAKILL")
+
+	buttonLabels := []string{"Play", "Quit"}
+
+	buttons := make([]*Button, len(buttonLabels))
+	for i, label := range buttonLabels {
+		buttons[i] = &Button{
+			label:       label,
+			delay:       float64(i) * 9, // i=0 → 0 delay, i=1 → 9 ticks delay (0.15s at 60fps)
+			duration:    60,
+			startX:      -100,
+			targetX:     150,
+			targetY:     float64(70 + i*45), // ← base Y position
+			index:       float64(i),         // ← for the i * 0.8 phase offset
+			currentX:    -100,
+			scale:       1.0,
+			targetScale: 1.0,
+			alpha:       1.0,
+			shakeDur:    0.15,
+		}
+	}
+
+	game := &Game{
+		fontFace:  fontFace,
+		titleFont: titleFont,  // ← add
+		buttons:   buttons,
+		bg:        loadImage("assets/background.png"),
+		particles: spawnParticles(100), // 50 particles, increase for more
+		gameScene: NewGameScene(),
+		audioContext: audioContext,
+    	musicPlayer:  musicPlayer,
+	}
+
+	if err := ebiten.RunGame(game); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// main funcs
+
+// func to change my font
+// define then output
+func loadFont(path string, size float64) text.Face {
+
+	// load da font file
+	fontData, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// parse da font file
+	fontSource, err := text.NewGoTextFaceSource(bytes.NewReader(fontData))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return &text.GoTextFace{
+		Source: fontSource,
+		Size:   size,
+	}
+}
+
+func (b *Button) Update(time float64, anyHovered bool, isHovered bool) {
+	dt := 1.0 / 60.0
+	textWidth := 40.0
+
+	// slide in
+	if b.timer < b.duration+b.delay {
+		b.timer++
+	}
+	t := (b.timer - b.delay) / b.duration
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	eased := backOut(t)
+	baseX := lerp(b.startX, b.targetX, eased)
+
+	// float
+	b.currentY = b.targetY + math.Sin(time*1.5+b.index*0.8)*3
+
+	// hover
+	if isHovered {
+		b.targetScale = 1.15
+		b.currentX = lerp(b.currentX, baseX-6, dt*10)
+		b.lineWidth = lerp(b.lineWidth, textWidth, dt*14)
+	} else {
+		b.targetScale = 1.0
+		b.currentX = lerp(b.currentX, baseX, dt*10)
+		b.lineWidth = lerp(b.lineWidth, 0, dt*14)
+	}
+
+	// punch on click
+	if isHovered && b.clicked {
+		b.scale = 1.3
+		b.shakeTimer = 0.15
+		b.clicked = false // consume it
+	} else {
+		b.clicked = false
+	}
+
+	// shake timer
+	if b.shakeTimer > 0 {
+		b.shakeTimer -= dt
+		b.shakeX = math.Sin(b.shakeTimer*80) * 3 // shake amount
+	} else {
+		b.shakeX = 0
+	}
+
+	// scale lerp back
+	b.scale = lerp(b.scale, b.targetScale, dt*12)
+
+	// dim
+	if anyHovered && !isHovered {
+		b.dimT = lerp(b.dimT, 1.0, dt*8)
+	} else {
+		b.dimT = lerp(b.dimT, 0.0, dt*8)
+	}
+	b.alpha = lerp(1.0, 0.3, b.dimT)
+}
+
+func loadImage(path string) *ebiten.Image {
+	img, _, err := ebitenutil.NewImageFromFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return img
+}
+
+func spawnParticles(count int) []*Particle {
+	particles := make([]*Particle, count)
+	for i := range particles {
+		particles[i] = &Particle{
+			x:     float64(rand.Intn(1024)),     // random x across screen
+			y:     float64(rand.Intn(768)),      // random y so they dont all start at bottom
+			speed: 0.3 + rand.Float64()*0.5,     // random speed
+			phase: rand.Float64() * math.Pi * 2, // random phase offset
+			drift: 0.5 + rand.Float64()*1.0,     // random drift amount
+			size:  1 + rand.Float64()*2,         // random size
+		}
+	}
+	return particles
+}
+
+func (p *Particle) Update(time float64) {
+	dt := 1.0 / 60.0
+
+	// your lua lines translated
+	p.y = p.y - p.speed*dt*60                  // float upward
+	p.x = p.x + math.Sin(time+p.phase)*p.drift // sway left/right
+
+	// if particle goes off the top, respawn at bottom
+	if p.y < -10 {
+		p.y = 780
+		p.x = float64(rand.Intn(1024))
+	}
+}
+
+func (b *Button) IsHovered(textWidth float64) bool {
+	mx, my := ebiten.CursorPosition()
+
+	return float64(mx) >= b.currentX && float64(mx) <= b.currentX+textWidth &&
+		float64(my) >= b.currentY-16 && float64(my) <= b.currentY+8
+}
+
+var wasPressed bool
+
+func justClicked() bool {
+	pressed := ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
+	if pressed && !wasPressed {
+		wasPressed = true
+		return true
+	}
+	if !pressed {
+		wasPressed = false
+	}
+	return false
+}
+
+
+func loadMusic(audioContext *audio.Context, path string) *audio.Player {
+    f, err := os.Open(path)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    stream, err := mp3.DecodeWithSampleRate(44100, f)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // loop the music
+    loop := audio.NewInfiniteLoop(stream, stream.Length())
+
+    player, err := audioContext.NewPlayer(loop)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    return player
+}
+
+
+
+
+
+
+
+
+
+// animation funcs
+
+// copy easing formula cuz im lazy
+
+// lerp - linear interpolation
+func lerp(start, end, t float64) float64 {
+	return start + (end-start)*t
+}
+
+// easing - back out effect (overshoots then settles)
+func backOut(t float64) float64 {
+	c := 1.70158
+	return 1 + (c+1)*math.Pow(t-1, 3) + c*math.Pow(t-1, 2)
 }
